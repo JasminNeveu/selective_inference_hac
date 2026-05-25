@@ -10,7 +10,7 @@ source("utils.R")
 CONFIG <- list(
   seed = 42,
   split_prop = 0.2,
-  n_pcs = 11,
+  n_pcs = 100,
   pc_search_seq = seq(1, 30, by = 2),
   dist_method = "euclidean",
   hclust_method = "ward.D",
@@ -21,6 +21,7 @@ CONFIG <- list(
 )
 
 main <- function() {
+  param_check()
   raw <- load_data()
   data <- raw$data
   super_pop <- raw$super_pop

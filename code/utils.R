@@ -1,3 +1,25 @@
+param_check <- function() {
+  if (CONFIG$split_prop > 1 || CONFIG$split_prop < 0) {
+    stop("split_prop should be in [0,1]")
+  }
+  if (!CONFIG$dist_method %in% c("euclidean")) {
+    stop("dist_method should be one of: euclidean")
+  }
+  if (!CONFIG$hclust_method %in% c(
+    "single", "average", "centroid",
+    "ward.D", "median", "mcquitty", "complete"
+  )) {
+    stop('hclust_method must be one of: single, average, centroid, ward.D, median, mcquitty, complete')
+  }
+  if (CONFIG$nb_cluster < 2 || CONFIG$nb_cluster > 100) {
+    stop("nb_cluster should be in [2,100]")
+  }
+  if (!CONFIG$lib %in% c("PCIdep", "clusterpval")) {
+    stop("lib must be one of: PCIdep, clusterpval")
+  }
+  print("Params checked")
+}
+
 load_data <- function() {
   data      <- readRDS("data/1KGP_100PC.Rda")
   super_pop <- read.table(
@@ -97,6 +119,7 @@ compute_pvals <- function(X, nb_cluster, pc, lib) {
 
   pvec
 }
+
 
 build_absolute <- function(pop_list, nb_cluster) {
   vapply(
