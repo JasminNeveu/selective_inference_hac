@@ -63,7 +63,7 @@ compute_pvals <- function(X, nb_cluster, pc, lib) {
     j <- pairs[r, 2]
     idx <- pair_to_idx(i, j, nb_cluster)
 
-    result <- switch(
+    p <- switch(
       lib,
 
       "PCIdep" = {
@@ -73,26 +73,26 @@ compute_pvals <- function(X, nb_cluster, pc, lib) {
           cluster = c(i, j),
           NC = nb_cluster,
           Y = Y
-        )
+        )$pvalue
       },
 
       "clusterpval" = {
-        test_hier_clusters_exact(
-          data_clust[, 1:pc],
+        clusterpval::test_hier_clusters_exact(
+          as.matrix(data_clust[, 1:pc]),
           link = "ward.D",
           K = nb_cluster,
           k1 = i,
           k2 = j,
           hcl = hcl
-        )
+        )$pval
       },
 
       stop("lib must be one of: PCIdep, clusterpval")
     )
 
-    pvec[idx] <- result$pvalue
+    pvec[idx] <- p
 
-    print(paste("Pair (", i, ",", j, ") - p =", result$pvalue))
+    print(paste("Pair (", i, ",", j, ") - p =", p))
   }
 
   pvec

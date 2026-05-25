@@ -10,12 +10,12 @@ source("utils.R")
 CONFIG <- list(
   seed = 42,
   split_prop = 0.2,
-  n_pcs = 13,
+  n_pcs = 11,
   pc_search_seq = seq(1, 30, by = 2),
   dist_method = "euclidean",
   hclust_method = "ward.D",
   output_dir = "output",
-  nb_cluster = 5,
+  nb_cluster = 26,
   lib = "PCIdep"
 
 )
@@ -29,18 +29,17 @@ main <- function() {
 
   clusters <- cutree(hcl_full, k = CONFIG$nb_cluster)
   pop_list <- build_pop_list(clusters, data$pop, super_pop)
-  cluster_mapping <- build_cluster_mapping(pop_list,nb_cluster)
+  cluster_mapping <- build_cluster_mapping(pop_list,CONFIG$nb_cluster)
 
-  # ground_truth <- build_absolute(pop_list, nb_cluster)
+  # ground_truth <- build_absolute(pop_list, CONFIG$nb_cluster)
 
-  # optim_pcs_df <- optim_pcs(X, nb_cluster, ground_truth)
+  # optim_pcs_df <- optim_pcs(X, CONFIG$nb_cluster, ground_truth)
   # save_plot(plot_pc_optim(optim_pcs_df), "distances_pcs.png")
-
-  print(paste("Computing p-values with",CONFIG$n_pcs,"PCs ...", "for", CONFIG$nb_cluster,"clusters"))
-  pvec <- compute_pvals(X, nb_cluster, CONFIG$n_pcs,CONFIG$lib)
+  print(paste("Computing p-values with",CONFIG$n_pcs,"PCs", "for", CONFIG$nb_cluster,"clusters", "with",CONFIG$lib, "package"))
+  pvec <- compute_pvals(X, CONFIG$nb_cluster, CONFIG$n_pcs,CONFIG$lib)
  
   save_plot(
-    plot_pval_heatmap(pvec, nb_cluster, cluster_mapping),
+    plot_pval_heatmap(pvec, CONFIG$nb_cluster, cluster_mapping),
     sprintf("heatmap_%s_pval_pc%02d.png", CONFIG$lib,CONFIG$n_pcs)
   )
   }
