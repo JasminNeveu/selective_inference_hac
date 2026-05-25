@@ -1,3 +1,4 @@
+library(aricode)
 library(PCIdep)
 library(ggplot2)
 library(reshape2)
@@ -36,13 +37,31 @@ main <- function() {
 
   # optim_pcs_df <- optim_pcs(X, CONFIG$nb_cluster, ground_truth)
   # save_plot(plot_pc_optim(optim_pcs_df), "distances_pcs.png")
-  print(paste("Computing p-values with",CONFIG$n_pcs,"PCs", "for", CONFIG$nb_cluster,"clusters", "with",CONFIG$lib, "package"))
-  pvec <- compute_pvals(X, CONFIG$nb_cluster, CONFIG$n_pcs,CONFIG$lib)
- 
-  save_plot(
-    plot_pval_heatmap(pvec, CONFIG$nb_cluster, cluster_mapping),
-    sprintf("heatmap_%s_pval_pc%02d.png", CONFIG$lib,CONFIG$n_pcs)
-  )
+  #
+  # print(paste("Computing p-values with",CONFIG$n_pcs,"PCs", "for", CONFIG$nb_cluster,"clusters", "with",CONFIG$lib, "package"))
+  # pvec <- compute_pvals(X, CONFIG$nb_cluster, CONFIG$n_pcs,CONFIG$lib)
+  # save_plot(
+  #   plot_pval_heatmap(pvec, CONFIG$nb_cluster, cluster_mapping),
+  #   sprintf("heatmap_%s_pval_pc%02d.png", CONFIG$lib,CONFIG$n_pcs)
+  # )
+  
+  s <- seq(1, 100, 2)
+  ari_scores <- numeric(length(s))
+
+  true_labels <- data$pop
+  for (idx in seq_along(s)) {
+    p <- s[idx]
+    hcl <- hclust(
+      dist(data_hcl[, 1:p], method = "euclidean"),
+      method = "ward.D"
+    )
+    ari <- compute_ari(true_labels, hcl, CONFIG$nb_cluster)
+    ari_scores[idx] <- ari
+    print(paste("p =", p, "ARI =", round(ari, 3)))
+  }
+
+  plot(s, ari_scores)
+
   }
 
 

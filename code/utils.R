@@ -120,6 +120,9 @@ compute_pvals <- function(X, nb_cluster, pc, lib) {
   pvec
 }
 
+compute_ari <- function(true_labels,hcl,k){
+  return(ARI(as.factor(true_labels), cutree(hcl,k=k)))
+}
 
 build_absolute <- function(pop_list, nb_cluster) {
   vapply(
