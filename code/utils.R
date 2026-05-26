@@ -38,12 +38,6 @@ n_pairs <- function(k){
   return(k * (k - 1) / 2)
 }
 
-fit_hclust <- function(X) {
-  hclust(
-    dist(X, method = CONFIG$dist_method),
-    method = CONFIG$hclust_method
-  )
-}
 
 build_pop_list <- function(clusters, pop_col, super_pop) {
   nb_cluster <- max(clusters)
@@ -64,15 +58,26 @@ build_pop_list <- function(clusters, pop_col, super_pop) {
   )
 }
 
-compute_pvals <- function(X, nb_cluster, pc, lib) {
 
+fit_hclust <- function(X) {
+  hclust(
+    stats::dist(X, method = CONFIG$dist_method)^2,
+    method = CONFIG$hclust_method
+  )
+}
+
+compute_pvals <- function(X, nb_cluster, pc, lib) {
   set.seed(CONFIG$seed)
 
   split <- initial_split(X, prop = CONFIG$split_prop)
-  Y <- training(split)[, seq_len(pc)]
+  Y <- training(split)[,1:pc]
   data_clust <- testing(split)
 
-  hcl <- fit_hclust(data_clust)
+  dismat <- stats::dist(data_clust, method = "euclidean")^2
+  hcl <- hclust(
+    dismat,
+    method = CONFIG$hclust_method
+  )
 
   pairs <- which(upper.tri(matrix(NA, nb_cluster, nb_cluster)), arr.ind = TRUE)
   pairs <- pairs[order(pairs[, 1], pairs[, 2]), ]
@@ -80,21 +85,19 @@ compute_pvals <- function(X, nb_cluster, pc, lib) {
   pvec <- numeric(n_pairs(nb_cluster))
 
   for (r in seq_len(nrow(pairs))) {
-
     i <- pairs[r, 1]
     j <- pairs[r, 2]
     idx <- pair_to_idx(i, j, nb_cluster)
-
     p <- switch(
       lib,
-
       "PCIdep" = {
         PCIdep::test.clusters.hc(
           hcl = hcl,
-          X = data_clust[, 1:pc],
+          X = data_clust[,1:pc],
           cluster = c(i, j),
           NC = nb_cluster,
-          Y = Y
+          Y = Y,
+          dismat = dismat
         )$pvalue
       },
 
@@ -111,7 +114,9 @@ compute_pvals <- function(X, nb_cluster, pc, lib) {
 
       stop("lib must be one of: PCIdep, clusterpval")
     )
-
+    if(p < 2.2e-16){
+      p <- 2.2e-16
+    }
     pvec[idx] <- p
 
     print(paste("Pair (", i, ",", j, ") - p =", p))
@@ -145,12 +150,10 @@ build_absolute <- function(pop_list, nb_cluster) {
 pval_l1_distance <- function(pvec, ground_truth){ 
   return(sum(abs(pvec - ground_truth)))}
 
-
-
-optim_pcs <- function(X, nb_cluster, ground_truth, pc_list = CONFIG$pc_search_seq) {
+optim_pcs <- function(X, nb_cluster, pc_list,ground_truth, lib) {
   results <- lapply(pc_list, function(pc) {
-    message(sprintf("Testing pc = %d ...", pc))
-    pvec <- compute_pvals(X, nb_cluster, pc)
+    print(paste("Testing pc = ",pc))
+    pvec <- compute_pvals(X, nb_cluster, pc,lib)
     data.frame(pc = pc, distance = pval_l1_distance(pvec, ground_truth))
   })
   do.call(rbind, results)
@@ -200,12 +203,15 @@ plot_pval_heatmap <- function(pvals_flat, nb_cluster, cluster_mapping) {
     geom_tile(color = "black", linewidth = 0.3) +
     scale_x_continuous(breaks = seq_len(nb_cluster), labels = ordered_clusters) +
     scale_y_continuous(breaks = seq_len(nb_cluster), labels = ordered_clusters) +
-    scale_fill_gradient(
-      low      = "#ffffff",
-      high     = "#1b263b",
+    scale_fill_gradientn(
+      colours  = c("#1b263b", "#ffffff"),
       name     = "p-value",
-      na.value = "white"
-    ) +
+      na.value = "white",
+      trans    = "log10",
+      limits   = c(2.2e-16, max(df_sym$pval, na.rm = TRUE)),
+      breaks   = c(2.2e-16, 1e-12, 1e-8),
+      labels   = c(expression("< 10"^-16), expression("10"^-12), expression("10"^-8))
+    )+
     coord_equal(clip = "off") +
     theme_minimal() +
     theme(
