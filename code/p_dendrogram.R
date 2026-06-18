@@ -1,4 +1,5 @@
 library(ggplot2)
+library(latex2exp)
 library(patchwork)
 library(MASS)
 library(dplyr)
@@ -57,7 +58,8 @@ plot.pdendrogram <- function(
   hcl,
   data_pvalues,
   labels_pvalues = FALSE,
-  treshold = 0.05,
+  threshold = 0.05,
+  strip_height_factor = 2,
   low = NULL,
   mid = NULL,
   high = NULL,
@@ -66,8 +68,8 @@ plot.pdendrogram <- function(
   groups_subclasses = NULL
 ) {
   # check paremeters
-  if (treshold < 0 || treshold > 1) {
-    warning("treshold must be an integer between 0 and 1.")
+  if (threshold < 0 || threshold > 1) {
+    warning("threshold must be an integer between 0 and 1.")
   }
   filled <- c(!is.null(low), !is.null(mid), !is.null(high))
   partial_defined <- sum(filled) > 0 && sum(filled) < 3
@@ -78,15 +80,15 @@ plot.pdendrogram <- function(
     )
   }
   if (!is.null(low) && !is.null(mid) && !is.null(high)) {
-    colours = c(low, mid, high)
+    colours <- c(low, mid, high)
   } else {
-    colours = c("#B2182B", "#D9C27A", "#2166AC") #option 3
+    colours <- c("#B2182B", "#D9C27A", "#2166AC") #option 3
   }
 
   p_floor <- 2.2e-16
-  breaks <- c(p_floor, treshold, 1)
-  labels <- c(expression("<10"^-16), as.character(treshold), "1")
-  vals <- rescale(log10(c(p_floor, treshold, 1)))
+  breaks <- c(p_floor, threshold, 1)
+  labels <- c("< 10⁻¹⁶", as.character(threshold), "1")
+  vals <- rescale(log10(c(p_floor, threshold, 1)))
 
   # plot branches
   p <- ggplot() +
@@ -115,14 +117,14 @@ plot.pdendrogram <- function(
       groups_subclasses
     )
 
-    leaves_long <- labels.group(
+    leaves_long <- build_leaves(
       groups = groups,
       ord = hcl$order,
-      groups_labels = groups_labels,
-      groups_subclasses = groups_subclasses
+      labels = groups_labels,
+      subclasses = groups_subclasses
     )
+    tmp <- assign_strip_positions(leaves_long, strip_height_factor)
 
-    tmp <- compute_strips(leaves_long)
     leaves_long <- tmp$data
     strip_height <- tmp$strip_height
     p <- add_cluster_strips(p, leaves_long, strip_height)
@@ -144,17 +146,16 @@ plot.pdendrogram <- function(
         row <- df[i, , drop = TRUE]
 
         txt <- paste0("\nsize = ", row[["cluster_size"]])
-
-        for (label in groups_labels) {
+        for (group_name in groups_labels) {
           txt <- paste0(
             txt,
             "\n",
-            label,
+            group_name,
             ": ",
-            row[[paste0(label, "_class")]],
+            row[[paste0(group_name, "_class")]],
             " (",
             round(
-              100 * as.numeric(row[[paste0(label, "_prop")]]),
+              100 * as.numeric(row[[paste0(group_name, "_prop")]]),
               1
             ),
             "%)"
@@ -168,7 +169,7 @@ plot.pdendrogram <- function(
     p <- p +
       geom_text(
         data = data_pvalues$merge_points %>%
-          filter(label < treshold & !is.null(label)),
+          filter(label < threshold & !is.na(label)),
         aes(
           x = x_mid,
           y = y,
@@ -179,6 +180,5 @@ plot.pdendrogram <- function(
         size = 3
       )
   }
-
   p
 }
