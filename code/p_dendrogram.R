@@ -1,71 +1,26 @@
 library(ggplot2)
-library(latex2exp)
+library(scales)
 library(patchwork)
 library(MASS)
 library(dplyr)
 library(ggdendro)
 library(fastcluster)
 library(PCIdep)
-library(scales)
 library(ggnewscale)
 
-
-build.data <- function(
-  X,
-  kmax = nrow(X) - 5,
-  U = NULL,
-  Sigma = NULL,
-  Y = NULL,
-  UY = NULL,
-  precUY = NULL,
-  linkage = 'ward.D',
-  hcl = NULL,
-  ndraws = 2000,
-  sample_split = FALSE,
-  nY = NULL,
-  return_Sigma = FALSE,
-  return_X_clus = FALSE,
-  dismat = NULL,
-  parallel_config = NULL
-) {
-  n <- nrow(X)
-  if (kmax < 1 || kmax > n - 1) {
-    stop("kmax must be an integer between 1 and n - 1.")
-  }
-  data_pvalues <- get.data(
-    hcl,
-    X,
-    U,
-    Sigma,
-    Y,
-    UY,
-    precUY,
-    linkage,
-    ndraws,
-    sample_split,
-    nY,
-    return_Sigma,
-    return_X_clus,
-    dismat,
-    kmax,
-    parallel_config
-  )
-  data_pvalues
-}
-
-
 plot.pdendrogram <- function(
+  pvals,
   hcl,
-  data_pvalues,
   labels_pvalues = FALSE,
   threshold = 0.05,
-  strip_height_factor = 2,
+  strip_height_factor = 1,
   low = NULL,
   mid = NULL,
   high = NULL,
   groups = NULL,
   groups_labels = NULL,
-  groups_subclasses = NULL
+  groups_subclasses = NULL,
+  log_height = FALSE
 ) {
   # check paremeters
   if (threshold < 0 || threshold > 1) {
@@ -85,10 +40,17 @@ plot.pdendrogram <- function(
     colours <- c("#B2182B", "#D9C27A", "#2166AC") #option 3
   }
 
+  if (log_height) {
+    hcl$height <- log10(hcl$height + 1)
+  }
+
   p_floor <- 2.2e-16
   breaks <- c(p_floor, threshold, 1)
-  labels <- c("< 10⁻¹⁶", as.character(threshold), "1")
+  # TODO: voir si on ne peut pas faire mieux que plain texte comme ça...
+  labels <- c("< 2.2⁻¹⁶", as.character(threshold), "1")
   vals <- rescale(log10(c(p_floor, threshold, 1)))
+
+  data_pvalues <- data.pdendrogram(pvals, hcl)
 
   # plot branches
   p <- ggplot() +
@@ -166,19 +128,103 @@ plot.pdendrogram <- function(
       },
       character(1)
     )
+    ymax <- max(data_pvalues$merge_points$y)
     p <- p +
       geom_text(
         data = data_pvalues$merge_points %>%
-          filter(label < threshold & !is.na(label)),
+          filter(!is.na(label)),
         aes(
           x = x_mid,
           y = y,
           label = label,
           text = paste0("p-value = ", label, "\nk = ", k, hover_text)
         ),
-        vjust = 1.5,
+        ,
+        vjust = "top",
         size = 3
       )
   }
   p
+}
+
+
+plot.ground.truth <- function(
+  pvals,
+  hcl,
+  threshold = 0.05,
+  population,
+  X,
+  log_axis = FALSE,
+  epsilon = 0
+) {
+  mean_hat <- get.mean_hat(X, population)
+  kmax <- length(pvals)
+  df <- data.frame(
+    x = numeric(0),
+    y = numeric(0),
+    status = character(0)
+  )
+  for (k in 2:kmax) {
+    individuals <- get.individuals.merged.clusters(hcl, k)
+    indiv1 <- individuals[[1]]
+    indiv2 <- individuals[[2]]
+
+    mu_1 <- colMeans(mean_hat[indiv1, , drop = FALSE])
+    mu_2 <- colMeans(mean_hat[indiv2, , drop = FALSE])
+    nu_t_mu <- norm(mu_1 - mu_2)
+
+    pval <- pvals[k - 1]
+
+    status <- dplyr::case_when(
+      pval < threshold & nu_t_mu > epsilon ~ "TP",
+      pval >= threshold & nu_t_mu < epsilon ~ "TN",
+      pval < threshold & nu_t_mu < epsilon ~ "FP",
+      pval >= threshold & nu_t_mu > epsilon ~ "FN"
+    )
+
+    df <- rbind(
+      df,
+      data.frame(
+        x = nu_t_mu,
+        y = pval,
+        status = status
+      )
+    )
+  }
+
+  p <- ggplot(df, aes(x = x, y = y, color = status)) +
+    geom_point(size = 3) +
+    theme_minimal() +
+    labs(
+      x = expression(nu^T * mu),
+      y = "p-value",
+      title = "Ground truth"
+    ) +
+    geom_hline(yintercept = threshold, linetype = "dashed", color = "red") +
+    annotate(
+      "text",
+      x = Inf,
+      y = threshold,
+      label = paste0("alpha = ", threshold),
+      hjust = 1.1,
+      vjust = -0.5,
+      color = "red"
+    )
+  if (log_axis) {
+    p <- p + scale_y_continuous(trans = 'log10')
+  }
+  p
+}
+
+
+plotly.pdendrogram <- function(p, slider = FALSE) {
+  # TODO: test if sliders == boolean sinon error
+  if (slider) {
+    p$layers$geom_text$mapping <- modifyList(
+      p$layers$geom_text$mapping,
+      aes(frame = k)
+    )
+  }
+
+  ggplotly(p, tooltip = "text") %>% style(textposition = "bottom")
 }

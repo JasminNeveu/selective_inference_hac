@@ -23,23 +23,24 @@ get.merged.clusters <- function(hcl, k) {
 }
 
 compute.pvals <- function(
-  hcl,
   X,
-  U,
-  Sigma,
   Y,
-  UY,
-  precUY,
-  linkage,
-  ndraws,
-  sample_split,
-  nY,
-  return_Sigma,
-  return_X_clus,
+  hcl = NULL,
+  kmax = nrow(X) - 5,
   dismat,
-  kmax,
-  parallel_config
+  parallel_config = NULL,
+  U = NULL,
+  Sigma = NULL,
+  UY = NULL,
+  precUY = NULL,
+  linkage = "ward.D",
+  ndraws = 2000,
+  sample_split = FALSE,
+  nY = NULL,
+  return_Sigma = FALSE,
+  return_X_clus = FALSE
 ) {
+  print(paste0("Computing the first ", kmax, " p-values of the dendrogram."))
   k_seq <- 2:kmax
 
   run_one_k <- function(k) {
@@ -64,6 +65,7 @@ compute.pvals <- function(
     )
 
     hc_test$pval <- ifelse(hc_test$pval < 2.2e-16, 2.2e-16, hc_test$pval)
+
     print(paste(
       "k =",
       k,
@@ -74,63 +76,76 @@ compute.pvals <- function(
       "---",
       hc_test$pval
     ))
+
     hc_test$pval
   }
 
   if (is.null(parallel_config) || !parallel_config$enabled) {
-    return(setNames(sapply(k_seq, run_one_k), k_seq))
+    pvals <- sapply(k_seq, run_one_k)
+  } else {
+    workers <- parallel_config$workers %||% (parallel::detectCores() - 1)
+    future::plan(future::multisession, workers = workers)
+    on.exit(future::plan(future::sequential), add = TRUE)
+
+    pvals <- unlist(furrr::future_map(k_seq, run_one_k))
   }
 
-  workers <- parallel_config$workers %||% (parallel::detectCores() - 1)
-  future::plan(future::multisession, workers = workers)
-  on.exit(future::plan(future::sequential), add = TRUE)
-
-  pvals <- unlist(furrr::future_map(k_seq, run_one_k))
   stats::setNames(pvals, k_seq)
 }
 
-get.data <- function(
-  hcl,
-  X,
-  U,
-  Sigma,
-  Y,
-  UY,
-  precUY,
-  linkage,
-  ndraws,
-  sample_split,
-  nY,
-  return_Sigma,
-  return_X_clus,
-  dismat,
-  kmax,
-  parallel_config
-) {
+compute.pvals.split <- function(G, MAP, kmax, split_size) {
+  k_seq <- 2:kmax
+  indices <- split.chromosomes(G, MAP, split_size)
+
+  svd1 <- bigsnpr::snp_autoSVD(
+    G,
+    infos.chr = MAP$chromosome,
+    infos.pos = MAP$physical.pos,
+    ind.col = indices$train
+  )
+
+  scores1 <- predict(svd1)
+  dismat <- dist(scores1, method = "euclidean")^2
+  hcl <- hclust(dismat, method = "ward.D")
+
+  # calcul pvalues sur test set
+  svd2 <- snp_autoSVD(
+    G = G,
+    infos.chr = MAP$chromosome,
+    infos.pos = MAP$physical.pos,
+    ind.col = indices$test
+  )
+
+  scores_X2 <- predict(svd2)
+  run_one_k <- function(k) {
+    clusters <- get.merged.clusters(hcl, k)
+    groupe_1 <- scores2[which(clusters == clusters[1]), ]
+    groupe_2 <- scores2[which(clusters == clusters[2]), ]
+    pvals <- Hotelling::hotelling.test(groupe_1, groupe_2)$pval
+  }
+  pval <- sapply(k_seq, run_one_k)
+  pval <- ifelse(pval < 2.2e-16, 2.2e-16, pval)
+  print(paste(
+    "k =",
+    k,
+    "clusters:",
+    clusters[1],
+    "-",
+    clusters[2],
+    "---",
+    pval
+  ))
+
+  pval
+}
+
+data.pdendrogram <- function(pvals, hcl) {
   hcldata <- ggdendro::dendro_data(hcl, type = "rectangle")
   hcldata$segments <- hcldata$segments[order(-hcldata$segments$y), ] # ordonne les segments pour qu'ils soient lister de haut en bas de l'arbre
   n <- nrow(hcldata$segments)
-  pvec <- compute.pvals(
-    hcl,
-    X,
-    U,
-    Sigma,
-    Y,
-    UY,
-    precUY,
-    linkage,
-    ndraws,
-    sample_split,
-    nY,
-    return_Sigma,
-    return_X_clus,
-    dismat,
-    kmax,
-    parallel_config
-  )
-  pvec_rep <- rep(pvec, each = 4)
+  pvals_rep <- rep(pvals, each = 4)
   hcldata$segments$pval <- NA
-  hcldata$segments$pval[1:length(pvec_rep)] <- pvec_rep
+  hcldata$segments$pval[1:length(pvals_rep)] <- pvals_rep
 
   # ------Add labels pvalues ------
   merge_points <- hcldata$segments %>%
@@ -141,7 +156,7 @@ get.data <- function(
     mutate(
       x_mid = (x_min + x_max) / 2,
       k = row_number() + 1,
-      label = c(signif(pvec, 3), rep(NA, n() - length(pvec)))
+      label = c(signif(pvals, 3), rep(NA, n() - length(pvals)))
     )
   hcldata$merge_points <- merge_points
   return(hcldata)
@@ -185,7 +200,6 @@ clustering.type <- function(x, tol = 2.1e-16) {
   if (is.factor(x) || is.character(x) || is.integer(x)) {
     return("hard")
   }
-
   if (is.list(x)) {
     same_length <- length(unique(lengths(x))) == 1
     valid_memberships <- all(vapply(
@@ -198,7 +212,6 @@ clustering.type <- function(x, tol = 2.1e-16) {
       },
       logical(1)
     ))
-
     if (same_length && valid_memberships) {
       return("soft")
     }
@@ -446,9 +459,10 @@ assign_strip_positions <- function(
   leaves_long,
   strip_height_factor,
   base_y = 0,
-  gap = 0.1
+  gap = 0.00001
 ) {
   n_indiv <- max(leaves_long$x, na.rm = TRUE)
+  # TODO: faire en sorte de prendre en compte log_height pour bien adapter stirp_heigt_factor et aussi prendre en copte la hauteur et pas le nombre d'indiv (meme si c'est collele la plus part du temps)
   strip_height <- strip_height_factor * n_indiv
   gap_size <- gap * n_indiv
 
@@ -527,4 +541,54 @@ add_cluster_strips <- function(p, leaves_long, strip_height) {
   }
 
   p
+}
+
+get.mean_hat <- function(data, population) {
+  pop_means <- aggregate(data, by = list(population = population), FUN = mean)
+  pop_means_mat <- as.matrix(pop_means[, -1])
+  mean_hat <- pop_means_mat[match(population, pop_means$population), ]
+  mean_hat
+}
+
+
+correction.multiplicity <- function(
+  pvals,
+  correction = c(
+    "ADDIS",
+    "online_fallback",
+    "holm",
+    "hochberg",
+    "hommel",
+    "bonferroni",
+    "BH",
+    "BY"
+  ),
+  alpha = 0.05
+) {
+  print(paste0(
+    "Correction multiplicity using",
+    correction,
+    "with a treshold of",
+    alpha
+  ))
+  correction <- match.arg(correction)
+
+  if (correction == "ADDIS") {
+    pvals <- ADDIS_spending(
+      pvals,
+      alpha = alpha
+    ) %>%
+      mutate(p_adjusted = pmin(1, alpha / alphai * pval)) %>%
+      pull(p_adjusted)
+  } else if (correction == "online_fallback") {
+    pvals <- online_fallback(
+      pvals,
+      alpha = alpha
+    ) %>%
+      mutate(p_adjusted = pmin(1, alpha / alphai * pval)) %>%
+      pull(p_adjusted)
+  } else {
+    pvals <- stats::p.adjust(pvals, method = correction)
+  }
+  pvals
 }
