@@ -22,6 +22,17 @@ get.merged.clusters <- function(hcl, k) {
   c(unname(c1), unname(c2))
 }
 
+
+build.parent.map <- function(merge_mat) {
+  n_merges <- nrow(merge_mat)
+  rows <- rep(seq_len(n_merges), times = 2)
+  children <- as.vector(merge_mat)
+  is_node <- children > 0
+  parent_of <- rep(NA_integer_, n_merges)
+  parent_of[children[is_node]] <- rows[is_node]
+  parent_of
+}
+
 compute.pvals <- function(
   X,
   Y,
@@ -38,13 +49,116 @@ compute.pvals <- function(
   sample_split = FALSE,
   nY = NULL,
   return_Sigma = FALSE,
-  return_X_clus = FALSE
+  return_X_clus = FALSE,
+  early_stop = FALSE,
+  alpha = 0.05,
+  show_progress = FALSE,
+  correction = NULL,
+  min_pts = 50
 ) {
-  print(paste0("Computing the first ", kmax, " p-values of the dendrogram."))
-  k_seq <- 2:kmax
+  if (early_stop && !is.null(parallel_config) && parallel_config$enabled) {
+    stop("Can't both parallelize and early stop at the same time.")
+  }
+  # TODO: vérifier si kmax > n-5 alors retourner erreur
+  if (kmax > nrow(X) - 5) {
+    stop("kmax should be lower than nrow(X) - 5")
+  }
+  online_methods <- c("ADDIS", "online_fallback")
+  if (early_stop && !is.null(correction) && !(correction %in% online_methods)) {
+    stop(
+      "With early_stop = TRUE, only a online correction (",
+      paste(online_methods, collapse = ", "),
+      ") can be applied",
+      "(holm, hochberg, hommel, bonferroni, BH, BY) retroactively recompute ",
+      "p-values already used to decide on blocking."
+    )
+  }
 
+  online_methods <- c("ADDIS", "online_fallback")
+  is_online_correction <- !is.null(correction) && correction %in% online_methods
+  size_text <- if (min_pts > 1) {
+    paste0(", min cluster size = ", min_pts)
+  } else {
+    ""
+  }
+
+  if (!early_stop) {
+    corr_text <- if (is.null(correction)) {
+      ""
+    } else if (is_online_correction) {
+      paste0(", ", correction, " correction (alpha = ", alpha, ")")
+    } else {
+      paste0(", ", correction, " correction")
+    }
+    cat(
+      "Computing p-values for k = 2..",
+      kmax,
+      corr_text,
+      size_text,
+      ".\n",
+      sep = ""
+    )
+  } else {
+    corr_text <- if (!is.null(correction)) {
+      paste0(", ", correction, " correction")
+    } else {
+      ""
+    }
+    cat(
+      "Computing p-values with branch-wise early stopping (alpha = ",
+      alpha,
+      ", kmax = ",
+      kmax,
+      ")",
+      corr_text,
+      size_text,
+      ".\n",
+      sep = ""
+    )
+  }
+
+  k_seq <- 2:kmax
+  n <- length(hcl$order)
+  parent_of_node <- build.parent.map(hcl$merge)
+  node.for.k <- function(k) n - k + 1
+  k.for.node <- function(node) n - node + 1
+  parent_k_of <- vapply(
+    k_seq,
+    function(k) {
+      parent_node <- parent_of_node[node.for.k(k)]
+      if (is.na(parent_node)) {
+        NA_integer_
+      } else {
+        as.integer(k.for.node(parent_node))
+      }
+    },
+    integer(1)
+  )
   run_one_k <- function(k) {
     clusters <- get.merged.clusters(hcl, k)
+    labs <- cutree(hcl, k = k)
+    size1 <- sum(labs == clusters[1])
+    size2 <- sum(labs == clusters[2])
+
+    if (size1 < min_pts || size2 < min_pts) {
+      print(paste(
+        "k =",
+        k,
+        "clusters:",
+        clusters[1],
+        "-",
+        clusters[2],
+        "--- cluster too small (sizes",
+        size1,
+        "/",
+        size2,
+        ", threshold =",
+        min_pts,
+        ") --- pval forced to 1"
+      ))
+      return(1)
+    }
+
     hc_test <- PCIdep::test.clusters.hc(
       X = X,
       U = U,
@@ -63,9 +177,7 @@ compute.pvals <- function(
       hcl = hcl,
       dismat = dismat
     )
-
-    hc_test$pval <- ifelse(hc_test$pval < 2.2e-16, 2.2e-16, hc_test$pval)
-
+    pval <- ifelse(hc_test$pval < 2.2e-16, 2.2e-16, hc_test$pval)
     print(paste(
       "k =",
       k,
@@ -74,23 +186,118 @@ compute.pvals <- function(
       "-",
       clusters[2],
       "---",
-      hc_test$pval
+      pval
     ))
-
-    hc_test$pval
+    pval
   }
 
-  if (is.null(parallel_config) || !parallel_config$enabled) {
-    pvals <- sapply(k_seq, run_one_k)
-  } else {
-    workers <- parallel_config$workers %||% (parallel::detectCores() - 1)
-    future::plan(future::multisession, workers = workers)
-    on.exit(future::plan(future::sequential), add = TRUE)
-
-    pvals <- unlist(furrr::future_map(k_seq, run_one_k))
+  if (!early_stop) {
+    if (is.null(parallel_config) || !parallel_config$enabled) {
+      pvals <- sapply(k_seq, run_one_k)
+    } else {
+      workers <- parallel_config$workers %||% (parallel::detectCores() - 1)
+      future::plan(future::multisession, workers = workers)
+      on.exit(future::plan(future::sequential), add = TRUE)
+      progressr::handlers("cli")
+      pvals <- progressr::with_progress(
+        {
+          p <- progressr::progressor(along = k_seq)
+          unlist(furrr::future_map(k_seq, function(k) {
+            res <- run_one_k(k)
+            p()
+            res
+          }))
+        },
+        enable = show_progress
+      )
+    }
+    pvals <- stats::setNames(pvals, k_seq)
+    if (!is.null(correction)) {
+      pvals <- correction.multiplicity(
+        pvals,
+        correction = correction,
+        alpha = alpha
+      )
+    }
+    return(pvals)
   }
 
+  pvals <- rep(NA_real_, length(k_seq))
+  raw_history <- numeric(0)
+  active_count <- 1
+
+  for (i in seq_along(k_seq)) {
+    k <- k_seq[i]
+    parent_k <- parent_k_of[i]
+    parent_pval <- if (is.na(parent_k)) NA_real_ else pvals[parent_k - 1]
+    is_blocked <- !is.na(parent_k) &&
+      (is.na(parent_pval) || parent_pval >= alpha)
+
+    if (is_blocked) {
+      print(paste(
+        "k =",
+        k,
+        "--- blocked (parent k =",
+        parent_k,
+        "not significant or already blocked)"
+      ))
+      next
+    }
+
+    raw_pval <- run_one_k(k)
+    raw_history <- c(raw_history, raw_pval)
+
+    if (is.null(correction)) {
+      decision_pval <- raw_pval
+    } else {
+      corrected_history <- correction.multiplicity(
+        raw_history,
+        correction = correction,
+        alpha = alpha,
+        verbose = FALSE
+      )
+      decision_pval <- corrected_history[length(corrected_history)]
+    }
+
+    pvals[i] <- decision_pval
+
+    active_count <- active_count - 1 + if (decision_pval < alpha) 2 else 0
+    if (active_count <= 0) {
+      print(paste0(
+        "All branches are blocked (k = ",
+        k,
+        ") - early stopping before kmax = ",
+        kmax,
+        "."
+      ))
+      break
+    }
+  }
   stats::setNames(pvals, k_seq)
+}
+
+get.k.list <- function(pvals, hcl, alpha = 0.05) {
+  n <- length(hcl$order)
+  merge <- hcl$merge
+  k_list <- integer(0)
+  visit <- function(row) {
+    k <- n - row + 1
+    pval <- pvals[as.character(k)]
+    if (is.na(pval) || pval >= alpha) {
+      k_list <<- c(k_list, k)
+      return()
+    }
+    children <- merge[row, ]
+    for (child in children) {
+      if (child > 0) {
+        visit(child)
+      }
+    }
+  }
+
+  visit(n - 1)
+
+  sort(unique(k_list))
 }
 
 compute.pvals.split <- function(G, MAP, kmax, split_size) {
@@ -192,7 +399,7 @@ get.individuals.merged.clusters <- function(hcl, k) {
 }
 
 get.individuals <- function(hcl, k) {
-  indiv <- get.individuals.merged.clusters(hcl, k + 1)
+  indiv <- get.individuals.merged.clusters(hcl, k)
   c(indiv[[1]], indiv[[2]])
 }
 
@@ -364,7 +571,6 @@ labels.groups <- function(
   data_pvalues
 }
 
-
 normalize_hard <- function(group, ord) {
   data.frame(
     x = seq_along(ord),
@@ -374,7 +580,6 @@ normalize_hard <- function(group, ord) {
     stringsAsFactors = FALSE
   )
 }
-
 
 normalize_soft <- function(group, subclasses, ord) {
   if (is.list(group)) {
@@ -487,7 +692,6 @@ prepare_soft_stack <- function(soft_df) {
   do.call(rbind, chunks)
 }
 
-
 add_cluster_strips <- function(p, leaves_long, strip_height) {
   soft_ids <- sort(unique(leaves_long$group_id[
     leaves_long$group_type == "soft"
@@ -551,6 +755,7 @@ get.mean_hat <- function(data, population) {
 }
 
 
+# changer data structurepour inclure date (jsp si ça change quelque chose)
 correction.multiplicity <- function(
   pvals,
   correction = c(
@@ -563,32 +768,33 @@ correction.multiplicity <- function(
     "BH",
     "BY"
   ),
-  alpha = 0.05
+  alpha = 0.05,
+  verbose = TRUE
 ) {
-  print(paste0(
-    "Correction multiplicity using",
-    correction,
-    "with a treshold of",
-    alpha
-  ))
   correction <- match.arg(correction)
-
+  if (verbose) {
+    print(paste0(
+      "Correct multiple hypothesis testing bias using ",
+      correction,
+      " with a threshold of ",
+      alpha
+    ))
+  }
+  non_na_idx <- 1:length(pvals)
+  if (anyNA(pvals)) {
+    non_na_idx <- which(!is.na(pvals))
+  }
   if (correction == "ADDIS") {
-    pvals <- ADDIS_spending(
-      pvals,
-      alpha = alpha
-    ) %>%
+    pvals_corrected <- ADDIS_spending(pvals, alpha = alpha) %>%
       mutate(p_adjusted = pmin(1, alpha / alphai * pval)) %>%
       pull(p_adjusted)
   } else if (correction == "online_fallback") {
-    pvals <- online_fallback(
-      pvals,
-      alpha = alpha
-    ) %>%
+    pvals_corrected <- online_fallback(pvals, alpha = alpha) %>%
       mutate(p_adjusted = pmin(1, alpha / alphai * pval)) %>%
       pull(p_adjusted)
   } else {
-    pvals <- stats::p.adjust(pvals, method = correction)
+    pvals_corrected <- stats::p.adjust(pvals, method = correction)
   }
+  pvals[non_na_idx] <- pvals_corrected
   pvals
 }

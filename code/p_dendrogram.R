@@ -1,4 +1,5 @@
 library(ggplot2)
+library(progressr)
 library(scales)
 library(patchwork)
 library(MASS)
@@ -9,10 +10,11 @@ library(PCIdep)
 library(ggnewscale)
 
 plot.pdendrogram <- function(
+  #TODO: checker parametres
   pvals,
   hcl,
   labels_pvalues = FALSE,
-  threshold = 0.05,
+  alpha = 0.05,
   strip_height_factor = 1,
   low = NULL,
   mid = NULL,
@@ -23,8 +25,8 @@ plot.pdendrogram <- function(
   log_height = FALSE
 ) {
   # check paremeters
-  if (threshold < 0 || threshold > 1) {
-    warning("threshold must be an integer between 0 and 1.")
+  if (alpha < 0 || alpha > 1) {
+    warning("alpha must be an integer between 0 and 1.")
   }
   filled <- c(!is.null(low), !is.null(mid), !is.null(high))
   partial_defined <- sum(filled) > 0 && sum(filled) < 3
@@ -45,10 +47,10 @@ plot.pdendrogram <- function(
   }
 
   p_floor <- 2.2e-16
-  breaks <- c(p_floor, threshold, 1)
+  breaks <- c(p_floor, alpha, 1)
   # TODO: voir si on ne peut pas faire mieux que plain texte comme ça...
-  labels <- c("< 2.2⁻¹⁶", as.character(threshold), "1")
-  vals <- rescale(log10(c(p_floor, threshold, 1)))
+  labels <- c("< 2.2⁻¹⁶", as.character(alpha), "1")
+  vals <- rescale(log10(c(p_floor, alpha, 1)))
 
   data_pvalues <- data.pdendrogram(pvals, hcl)
 
@@ -148,77 +150,14 @@ plot.pdendrogram <- function(
 }
 
 
-plot.ground.truth <- function(
-  pvals,
-  hcl,
-  threshold = 0.05,
-  population,
-  X,
-  log_axis = FALSE,
-  epsilon = 0
-) {
-  mean_hat <- get.mean_hat(X, population)
-  kmax <- length(pvals)
-  df <- data.frame(
-    x = numeric(0),
-    y = numeric(0),
-    status = character(0)
-  )
-  for (k in 2:kmax) {
-    individuals <- get.individuals.merged.clusters(hcl, k)
-    indiv1 <- individuals[[1]]
-    indiv2 <- individuals[[2]]
-
-    mu_1 <- colMeans(mean_hat[indiv1, , drop = FALSE])
-    mu_2 <- colMeans(mean_hat[indiv2, , drop = FALSE])
-    nu_t_mu <- norm(mu_1 - mu_2)
-
-    pval <- pvals[k - 1]
-
-    status <- dplyr::case_when(
-      pval < threshold & nu_t_mu > epsilon ~ "TP",
-      pval >= threshold & nu_t_mu < epsilon ~ "TN",
-      pval < threshold & nu_t_mu < epsilon ~ "FP",
-      pval >= threshold & nu_t_mu > epsilon ~ "FN"
-    )
-
-    df <- rbind(
-      df,
-      data.frame(
-        x = nu_t_mu,
-        y = pval,
-        status = status
-      )
-    )
-  }
-
-  p <- ggplot(df, aes(x = x, y = y, color = status)) +
-    geom_point(size = 3) +
-    theme_minimal() +
-    labs(
-      x = expression(nu^T * mu),
-      y = "p-value",
-      title = "Ground truth"
-    ) +
-    geom_hline(yintercept = threshold, linetype = "dashed", color = "red") +
-    annotate(
-      "text",
-      x = Inf,
-      y = threshold,
-      label = paste0("alpha = ", threshold),
-      hjust = 1.1,
-      vjust = -0.5,
-      color = "red"
-    )
-  if (log_axis) {
-    p <- p + scale_y_continuous(trans = 'log10')
-  }
-  p
-}
-
-
 plotly.pdendrogram <- function(p, slider = FALSE) {
-  # TODO: test if sliders == boolean sinon error
+  if (!is_ggplot(p)) {
+    stop("p should be an ggplot object.")
+  }
+  if (!is.logical(slider)) {
+    stop("slider should be a boolean.")
+  }
+
   if (slider) {
     p$layers$geom_text$mapping <- modifyList(
       p$layers$geom_text$mapping,
@@ -227,4 +166,111 @@ plotly.pdendrogram <- function(p, slider = FALSE) {
   }
 
   ggplotly(p, tooltip = "text") %>% style(textposition = "bottom")
+}
+
+selective.cutree <- function(hcl, k_list) {
+  n <- length(hcl$order)
+  labels <- numeric(n)
+  for (i in seq_len(length(k_list))) {
+    k <- k_list[i]
+    indiv <- get.individuals(hcl, k)
+    labels[indiv] <- i
+  }
+  labels
+}
+
+plot.heatmap <- function(
+  clusters,
+  population,
+  super_population = NULL,
+  cluster_name = "Cluster",
+  population_name = "Population"
+) {
+  stopifnot(length(clusters) == length(population))
+
+  tab <- table(population, clusters)
+  tab_prop <- prop.table(tab, margin = 1)
+
+  best_cluster <- apply(tab_prop, 1, which.max)
+  pop_order <- names(sort(best_cluster))
+
+  df <- as.data.frame(tab_prop)
+  colnames(df) <- c("population", "cluster", "prop")
+
+  df$population <- factor(df$population, levels = pop_order)
+  df$cluster <- factor(df$cluster, levels = sort(unique(clusters)))
+
+  p <- ggplot(df, aes(population, cluster, fill = prop)) +
+    geom_tile(color = "black", linewidth = 0.3) +
+    coord_fixed() +
+    labs(
+      x = population_name,
+      y = cluster_name,
+      fill = "Proportion"
+    ) +
+    scale_fill_gradient(
+      low = "white",
+      high = "#1b263b"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(
+        angle = 90,
+        hjust = 1,
+        vjust = 0.5
+      )
+    )
+
+  if (!is.null(super_population)) {
+    stopifnot(length(super_population) == length(population))
+
+    label_df <- data.frame(
+      population = population,
+      super_population = super_population
+    ) |>
+      dplyr::distinct()
+
+    label_df <- label_df[match(pop_order, label_df$population), ]
+
+    superpop_colors <- c(
+      AFR = "#ff9f1c",
+      AMR = "#e71d36",
+      EAS = "#2ec4b6",
+      EUR = "#011627",
+      SAS = "#984EA3"
+    )
+
+    label_colors <- superpop_colors[label_df$super_population]
+
+    p <- p +
+      geom_point(
+        data = transform(
+          df,
+          super_population = label_df$super_population[
+            match(population, label_df$population)
+          ]
+        ),
+        aes(color = super_population),
+        alpha = 0,
+        inherit.aes = TRUE
+      ) +
+      scale_color_manual(
+        values = superpop_colors,
+        name = "Super-population",
+        guide = guide_legend(
+          override.aes = list(alpha = 1, size = 3)
+        )
+      ) +
+      theme(
+        axis.text.x = element_text(
+          angle = 90,
+          hjust = 1,
+          vjust = 0.5,
+          colour = label_colors
+        )
+      )
+  }
+
+  p
 }
