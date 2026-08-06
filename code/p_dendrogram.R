@@ -141,7 +141,7 @@ plot.pdendrogram <- function(
           label = label,
           text = paste0("p-value = ", label, "\nk = ", k, hover_text)
         ),
-        ,
+
         vjust = "top",
         size = 3
       )
@@ -168,106 +168,168 @@ plotly.pdendrogram <- function(p, slider = FALSE) {
   ggplotly(p, tooltip = "text") %>% style(textposition = "bottom")
 }
 
-selective.cutree <- function(hcl, k_list) {
+
+selective.cutree <- function(hcl, pvals, alpha = 0.05, min_pts = 1) {
   n <- length(hcl$order)
-  labels <- numeric(n)
-  for (i in seq_len(length(k_list))) {
-    k <- k_list[i]
-    indiv <- get.individuals(hcl, k)
-    labels[indiv] <- i
+  labels <- integer(n) # Par défaut, tout est initialisé à 0 (Bruit)
+  node_sizes <- get.node.sizes(hcl)
+  cluster_id <- 1L
+
+  visit <- function(row) {
+    k <- n - row + 1
+    c1 <- hcl$merge[row, 1]
+    c2 <- hcl$merge[row, 2]
+
+    s1 <- if (c1 < 0) 1L else node_sizes[c1]
+    s2 <- if (c2 < 0) 1L else node_sizes[c2]
+
+    # Cas 1 : Les deux sous-clusters sont trop petits -> Bruit (reste 0)
+    if (s1 < min_pts && s2 < min_pts) {
+      return()
+    }
+
+    # Cas 2 : c1 est trop petit (bruit), c2 est valide -> continuer dans c2
+    if (s1 < min_pts && s2 >= min_pts) {
+      if (c2 > 0) {
+        visit(c2)
+      } else {
+        labels[-c2] <<- cluster_id
+        cluster_id <<- cluster_id + 1L
+      }
+      return()
+    }
+
+    # Cas 3 : c2 est trop petit (bruit), c1 est valide -> continuer dans c1
+    if (s2 < min_pts && s1 >= min_pts) {
+      if (c1 > 0) {
+        visit(c1)
+      } else {
+        labels[-c1] <<- cluster_id
+        cluster_id <<- cluster_id + 1L
+      }
+      return()
+    }
+
+    # Cas 4 : Les deux sont >= min_pts -> vérifier la p-value
+    pval <- pvals[as.character(k)]
+
+    # Si pval est NA ou non significative (>= alpha), on s'arrête et on crée un cluster
+    if (is.na(pval) || pval >= alpha) {
+      leafs <- get.node.leafs(hcl, row)
+      labels[leafs] <<- cluster_id
+      cluster_id <<- cluster_id + 1L
+      return()
+    }
+
+    # Si pval < alpha, on continue de descendre dans les deux branches
+    if (c1 > 0) {
+      visit(c1)
+    } else {
+      labels[-c1] <<- cluster_id
+      cluster_id <<- cluster_id + 1L
+    }
+    if (c2 > 0) {
+      visit(c2)
+    } else {
+      labels[-c2] <<- cluster_id
+      cluster_id <<- cluster_id + 1L
+    }
   }
+  visit(n - 1)
   labels
 }
 
+
 plot.heatmap <- function(
-  clusters,
-  population,
+  true_labels,
+  predicted_clusters,
   super_population = NULL,
-  cluster_name = "Cluster",
-  population_name = "Population"
+  prop = FALSE,
+  predicted_clusters_name = "Clusters"
 ) {
-  stopifnot(length(clusters) == length(population))
+  M <- build.heatmap.matrix(true_labels, predicted_clusters, prop)
+  df <- as.data.frame(as.table(M))
+  names(df) <- c("Cluster", "Label", "Value")
 
-  tab <- table(population, clusters)
-  tab_prop <- prop.table(tab, margin = 1)
-
-  best_cluster <- apply(tab_prop, 1, which.max)
-  pop_order <- names(sort(best_cluster))
-
-  df <- as.data.frame(tab_prop)
-  colnames(df) <- c("population", "cluster", "prop")
-
-  df$population <- factor(df$population, levels = pop_order)
-  df$cluster <- factor(df$cluster, levels = sort(unique(clusters)))
-
-  p <- ggplot(df, aes(population, cluster, fill = prop)) +
-    geom_tile(color = "black", linewidth = 0.3) +
-    coord_fixed() +
-    labs(
-      x = population_name,
-      y = cluster_name,
-      fill = "Proportion"
-    ) +
-    scale_fill_gradient(
-      low = "white",
-      high = "#1b263b"
-    ) +
-    theme_minimal() +
-    theme(
-      panel.grid = element_blank(),
-      axis.text.x = element_text(
-        angle = 90,
-        hjust = 1,
-        vjust = 0.5
-      )
-    )
+  legend_text <- if (prop) "Proportion" else "Count"
 
   if (!is.null(super_population)) {
-    stopifnot(length(super_population) == length(population))
+    col_labels <- colnames(M)
 
-    label_df <- data.frame(
-      population = population,
-      super_population = super_population
-    ) |>
-      dplyr::distinct()
+    # Matching sécurisé s'adaptant au type (entier, caractère, facteur)
+    matched_superpop <- super_population[as.character(col_labels)]
 
-    label_df <- label_df[match(pop_order, label_df$population), ]
+    if (any(is.na(matched_superpop))) {
+      warning("Certains labels n'ont pas de super_population associée.")
+    }
 
-    superpop_colors <- c(
-      AFR = "#ff9f1c",
-      AMR = "#e71d36",
-      EAS = "#2ec4b6",
-      EUR = "#011627",
-      SAS = "#984EA3"
+    unique_superpops <- unique(na.omit(matched_superpop))
+    n_superpops <- length(unique_superpops)
+
+    if (n_superpops <= 8) {
+      palette_colors <- RColorBrewer::brewer.pal(max(3, n_superpops), "Set1")[
+        1:n_superpops
+      ]
+    } else {
+      palette_colors <- rainbow(n_superpops)
+    }
+
+    superpop_colors <- setNames(palette_colors, unique_superpops)
+    label_colors <- unname(superpop_colors[matched_superpop])
+  }
+
+  p <- ggplot(
+    df,
+    aes(x = Label, y = factor(Cluster, levels = rownames(M)), fill = Value)
+  ) +
+    geom_tile(color = "black", linewidth = 0.3) +
+    coord_fixed() +
+    scale_fill_gradient(low = "white", high = "#1b263b") +
+    labs(
+      x = "True population",
+      y = predicted_clusters_name,
+      fill = legend_text
+    ) +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+
+  if (!is.null(super_population)) {
+    col_labels_orig <- type.convert(colnames(M), as.is = TRUE)
+
+    legend_df <- data.frame(
+      Label = col_labels_orig,
+      Cluster = rownames(M)[1],
+      super_population = matched_superpop
     )
 
-    label_colors <- superpop_colors[label_df$super_population]
-
+    angle_text <- if (is.character(true_labels)) 90 else 0
     p <- p +
       geom_point(
-        data = transform(
-          df,
-          super_population = label_df$super_population[
-            match(population, label_df$population)
-          ]
-        ),
-        aes(color = super_population),
+        data = legend_df,
+        aes(x = Label, y = Cluster, color = super_population),
         alpha = 0,
-        inherit.aes = TRUE
+        inherit.aes = FALSE
       ) +
       scale_color_manual(
         values = superpop_colors,
         name = "Super-population",
-        guide = guide_legend(
-          override.aes = list(alpha = 1, size = 3)
-        )
+        guide = guide_legend(override.aes = list(alpha = 1, size = 3))
       ) +
+      theme(
+        axis.text.x = element_text(
+          angle = angle_text,
+          hjust = 1,
+          vjust = 0.5,
+          colour = label_colors
+        )
+      )
+  } else {
+    p <- p +
       theme(
         axis.text.x = element_text(
           angle = 90,
           hjust = 1,
-          vjust = 0.5,
-          colour = label_colors
+          vjust = 0.5
         )
       )
   }

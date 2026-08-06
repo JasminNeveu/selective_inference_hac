@@ -22,7 +22,6 @@ get.merged.clusters <- function(hcl, k) {
   c(unname(c1), unname(c2))
 }
 
-
 build.parent.map <- function(merge_mat) {
   n_merges <- nrow(merge_mat)
   rows <- rep(seq_len(n_merges), times = 2)
@@ -33,28 +32,41 @@ build.parent.map <- function(merge_mat) {
   parent_of
 }
 
-compute.pvals <- function(
+twosamp.perm <- function(y, z, fun, nsamp = 9999) {
+  m <- nrow(y)
+  n <- nrow(z)
+  N <- n + m
+  x <- rbind(y, z)
+  tobs <- fun(y, z)
+  sig <- replicate(nsamp, sample.int(N, m))
+  tperm <- apply(
+    sig,
+    2,
+    function(g, x) {
+      fun(x[g, ], x[-g, ])
+    },
+    x = x
+  )
+  p <- sum(abs(tperm) >= abs(tobs)) + 1
+  list(statistic = tobs, sample.perm = tperm, p.value = p / (nsamp + 1))
+}
+
+meandif <- function(y, z) sum((colMeans(y) - colMeans(z))^2)
+
+
+compute.pvals.features.splitting <- function(
   X,
-  Y,
   hcl = NULL,
   kmax = nrow(X) - 5,
-  dismat,
+  nsamp = 9999,
   parallel_config = NULL,
-  U = NULL,
-  Sigma = NULL,
-  UY = NULL,
-  precUY = NULL,
   linkage = "ward.D",
-  ndraws = 2000,
-  sample_split = FALSE,
-  nY = NULL,
-  return_Sigma = FALSE,
-  return_X_clus = FALSE,
   early_stop = FALSE,
-  alpha = 0.05,
   show_progress = FALSE,
   correction = NULL,
-  min_pts = 50
+  min_pts = 1,
+  alpha = 0.05,
+  verbose = FALSE
 ) {
   if (early_stop && !is.null(parallel_config) && parallel_config$enabled) {
     stop("Can't both parallelize and early stop at the same time.")
@@ -141,6 +153,31 @@ compute.pvals <- function(
     size2 <- sum(labs == clusters[2])
 
     if (size1 < min_pts || size2 < min_pts) {
+      if (verbose) {
+        print(paste(
+          "k =",
+          k,
+          "clusters:",
+          clusters[1],
+          "-",
+          clusters[2],
+          "--- cluster too small (sizes",
+          size1,
+          "/",
+          size2,
+          ", threshold =",
+          min_pts,
+          ") --- pval forced to 1"
+        ))
+      }
+      return(1)
+    }
+
+    y <- X[labs == clusters[1], ]
+    z <- X[labs == clusters[2], ]
+    pval <- twosamp.perm(y, z, meandif, nsamp)$p.value
+    pval <- ifelse(pval < 2.2e-16, 2.2e-16, pval)
+    if (verbose) {
       print(paste(
         "k =",
         k,
@@ -148,46 +185,10 @@ compute.pvals <- function(
         clusters[1],
         "-",
         clusters[2],
-        "--- cluster too small (sizes",
-        size1,
-        "/",
-        size2,
-        ", threshold =",
-        min_pts,
-        ") --- pval forced to 1"
+        "---",
+        pval
       ))
-      return(1)
     }
-
-    hc_test <- PCIdep::test.clusters.hc(
-      X = X,
-      U = U,
-      Sigma = Sigma,
-      Y = Y,
-      UY = UY,
-      precUY = precUY,
-      linkage = linkage,
-      NC = k,
-      clusters = clusters,
-      ndraws = ndraws,
-      sample_split = sample_split,
-      nY = nY,
-      return_Sigma = return_Sigma,
-      return_X_clus = return_X_clus,
-      hcl = hcl,
-      dismat = dismat
-    )
-    pval <- ifelse(hc_test$pval < 2.2e-16, 2.2e-16, hc_test$pval)
-    print(paste(
-      "k =",
-      k,
-      "clusters:",
-      clusters[1],
-      "-",
-      clusters[2],
-      "---",
-      pval
-    ))
     pval
   }
 
@@ -234,13 +235,15 @@ compute.pvals <- function(
       (is.na(parent_pval) || parent_pval >= alpha)
 
     if (is_blocked) {
-      print(paste(
-        "k =",
-        k,
-        "--- blocked (parent k =",
-        parent_k,
-        "not significant or already blocked)"
-      ))
+      if (verbose) {
+        print(paste(
+          "k =",
+          k,
+          "--- blocked (parent k =",
+          parent_k,
+          "not significant or already blocked)"
+        ))
+      }
       next
     }
 
@@ -263,42 +266,467 @@ compute.pvals <- function(
 
     active_count <- active_count - 1 + if (decision_pval < alpha) 2 else 0
     if (active_count <= 0) {
-      print(paste0(
-        "All branches are blocked (k = ",
-        k,
-        ") - early stopping before kmax = ",
-        kmax,
-        "."
-      ))
+      if (verbose) {
+        print(paste0(
+          "All branches are blocked (k = ",
+          k,
+          ") - early stopping before kmax = ",
+          kmax,
+          "."
+        ))
+      }
       break
     }
   }
   stats::setNames(pvals, k_seq)
 }
 
-get.k.list <- function(pvals, hcl, alpha = 0.05) {
+get.node.sizes <- function(hcl) {
   n <- length(hcl$order)
-  merge <- hcl$merge
-  k_list <- integer(0)
-  visit <- function(row) {
-    k <- n - row + 1
-    pval <- pvals[as.character(k)]
-    if (is.na(pval) || pval >= alpha) {
-      k_list <<- c(k_list, k)
-      return()
-    }
-    children <- merge[row, ]
-    for (child in children) {
-      if (child > 0) {
-        visit(child)
+  sizes <- integer(n - 1)
+  for (i in 1:(n - 1)) {
+    c1 <- hcl$merge[i, 1]
+    c2 <- hcl$merge[i, 2]
+    s1 <- if (c1 < 0) 1L else sizes[c1]
+    s2 <- if (c2 < 0) 1L else sizes[c2]
+    sizes[i] <- s1 + s2
+  }
+  sizes
+}
+
+get.node.leafs <- function(hcl, id) {
+  if (id < 0) {
+    return(-id)
+  }
+  c1 <- hcl$merge[id, 1]
+  c2 <- hcl$merge[id, 2]
+  c(get.node.leafs(hcl, c1), get.node.leafs(hcl, c2))
+}
+
+
+compute.pvals <- function(
+  X,
+  Y,
+  hcl = NULL,
+  kmax = nrow(X) - 5,
+  dismat,
+  parallel_config = NULL,
+  U = NULL,
+  Sigma = NULL,
+  UY = NULL,
+  precUY = NULL,
+  linkage = "ward.D",
+  ndraws = 2000,
+  sample_split = FALSE,
+  nY = NULL,
+  return_Sigma = FALSE,
+  return_X_clus = FALSE,
+  early_stop = FALSE,
+  alpha = 0.05,
+  show_progress = FALSE,
+  correction = NULL,
+  min_pts = 1,
+  verbose = FALSE
+) {
+  if (early_stop && !is.null(parallel_config) && parallel_config$enabled) {
+    stop("Can't both parallelize and early stop at the same time.")
+  }
+  if (kmax > nrow(X) - 5) {
+    stop("kmax should be lower than nrow(X) - 5")
+  }
+
+  online_methods <- c("ADDIS", "online_fallback")
+  is_online_correction <- !is.null(correction) && correction %in% online_methods
+  if (early_stop && !is.null(correction) && !is_online_correction) {
+    stop(
+      "With early_stop = TRUE, only an online correction (",
+      paste(online_methods, collapse = ", "),
+      ") can be applied."
+    )
+  }
+
+  size_text <- if (min_pts > 1) paste0(", min cluster size = ", min_pts) else ""
+  corr_text <- if (is.null(correction)) {
+    ""
+  } else if (is_online_correction) {
+    paste0(", ", correction, " correction (alpha = ", alpha, ")")
+  } else {
+    paste0(", ", correction, " correction")
+  }
+
+  if (!early_stop) {
+    cat(
+      "Computing p-values for k = 2..",
+      kmax,
+      corr_text,
+      size_text,
+      ".\n",
+      sep = ""
+    )
+  } else {
+    cat(
+      "Computing p-values with branch-wise early stopping (alpha = ",
+      alpha,
+      ", kmax = ",
+      kmax,
+      ")",
+      corr_text,
+      size_text,
+      ".\n",
+      sep = ""
+    )
+  }
+
+  k_seq <- 2:kmax
+  n <- length(hcl$order)
+  node_sizes <- get.node.sizes(hcl)
+  parent_of_node <- build.parent.map(hcl$merge)
+
+  node.for.k <- function(k) n - k + 1
+  k.for.node <- function(node) n - node + 1
+
+  parent_k_of <- vapply(
+    k_seq,
+    function(k) {
+      parent_node <- parent_of_node[node.for.k(k)]
+      if (is.na(parent_node)) {
+        NA_integer_
+      } else {
+        as.integer(k.for.node(parent_node))
       }
+    },
+    integer(1)
+  )
+
+  run_one_k <- function(k) {
+    node <- node.for.k(k)
+    c1_id <- hcl$merge[node, 1]
+    c2_id <- hcl$merge[node, 2]
+
+    size1 <- if (c1_id < 0) 1L else node_sizes[c1_id]
+    size2 <- if (c2_id < 0) 1L else node_sizes[c2_id]
+    total_size <- size1 + size2
+
+    # --- CORRECTION ---
+    # Si le cluster courant est DÉJÀ plus petit que min_pts, c'est une sous-branche
+    # isolée dans le bruit par son parent. On annule l'évaluation.
+    if (total_size < min_pts) {
+      if (verbose) {
+        cat(
+          "k =",
+          k,
+          "--- Noeud totalement dans le bruit (taille",
+          total_size,
+          "<",
+          min_pts,
+          ") -> NA (ignoré)\n"
+        )
+      }
+      return(NA_real_)
+    }
+
+    # Cas 1 : Taille globale OK, mais les deux sous-clusters sont trop petits -> pval = 1 (blocage)
+    if (size1 < min_pts && size2 < min_pts) {
+      if (verbose) {
+        cat(
+          "k =",
+          k,
+          "--- Les deux enfants sont trop petits (",
+          size1,
+          "/",
+          size2,
+          ") -> pval = 1\n"
+        )
+      }
+      return(1)
+    }
+
+    # Cas 2 : Un cluster est trop petit (outlier/bruit) -> pval = NA (séparation forcée, pas de test stat)
+    if (size1 < min_pts || size2 < min_pts) {
+      if (verbose) {
+        cat(
+          "k =",
+          k,
+          "--- Split asymétrique bruit (",
+          size1,
+          "vs",
+          size2,
+          ") -> pval = NA (branchement forcé)\n"
+        )
+      }
+      return(NA_real_)
+    }
+
+    # Cas 3 : Les deux clusters sont >= min_pts -> calcul du test statistique
+    clusters <- get.merged.clusters(hcl, k)
+    hc_test <- PCIdep::test.clusters.hc(
+      X = X,
+      U = U,
+      Sigma = Sigma,
+      Y = Y,
+      UY = UY,
+      precUY = precUY,
+      linkage = linkage,
+      NC = k,
+      clusters = clusters,
+      ndraws = ndraws,
+      sample_split = sample_split,
+      nY = nY,
+      return_Sigma = return_Sigma,
+      return_X_clus = return_X_clus,
+      hcl = hcl,
+      dismat = dismat
+    )
+    pval <- ifelse(hc_test$pval < 2.2e-16, 2.2e-16, hc_test$pval)
+
+    if (verbose) {
+      cat(
+        "k =",
+        k,
+        "clusters:",
+        clusters[1],
+        "-",
+        clusters[2],
+        "--- pval =",
+        pval,
+        "\n"
+      )
+    }
+
+    pval
+  }
+
+  pvals <- rep(NA_real_, length(k_seq))
+  names(pvals) <- as.character(k_seq)
+
+  # Suivi de l'état bloqué propagé le long des branches
+  is_node_blocked <- setNames(rep(FALSE, length(k_seq)), as.character(k_seq))
+
+  # Mode sans early_stop (calcul direct / parallélisé)
+  if (!early_stop) {
+    if (is.null(parallel_config) || !parallel_config$enabled) {
+      pvals_raw <- sapply(k_seq, run_one_k)
+    } else {
+      workers <- parallel_config$workers %||% (parallel::detectCores() - 1)
+      future::plan(future::multisession, workers = workers)
+      on.exit(future::plan(future::sequential), add = TRUE)
+      progressr::handlers("cli")
+      pvals_raw <- progressr::with_progress(
+        {
+          p <- progressr::progressor(along = k_seq)
+          unlist(furrr::future_map(k_seq, function(k) {
+            res <- run_one_k(k)
+            p()
+            res
+          }))
+        },
+        enable = show_progress
+      )
+    }
+    pvals <- stats::setNames(pvals_raw, as.character(k_seq))
+
+    # --- CORRECTION ---
+    # Application du filtre de blocage ancestral et vérification de la taille globale
+    for (i in seq_along(k_seq)) {
+      k <- k_seq[i]
+      parent_k <- parent_k_of[i]
+      node <- node.for.k(k)
+
+      # Si le nœud est lui-même plus petit que min_pts, il initie le blocage pour ses enfants
+      if (node_sizes[node] < min_pts) {
+        is_node_blocked[as.character(k)] <- TRUE
+        pvals[as.character(k)] <- NA_real_
+      }
+
+      if (!is.na(parent_k)) {
+        parent_k_str <- as.character(parent_k)
+        parent_blocked <- is_node_blocked[parent_k_str]
+        parent_pval <- pvals[parent_k_str]
+        if (parent_blocked || (!is.na(parent_pval) && parent_pval >= alpha)) {
+          is_node_blocked[as.character(k)] <- TRUE
+          pvals[as.character(k)] <- NA_real_
+        }
+      }
+    }
+
+    if (!is.null(correction)) {
+      pvals <- correction.multiplicity(
+        pvals,
+        correction = correction,
+        alpha = alpha,
+        verbose = FALSE
+      )
+    }
+    return(pvals)
+  }
+
+  # Mode early_stop (Séquentiel avec arrêt anticipé et héritage ancestral)
+  raw_history <- numeric(0)
+  active_count <- 1
+
+  for (i in seq_along(k_seq)) {
+    k <- k_seq[i]
+    k_str <- as.character(k)
+    parent_k <- parent_k_of[i]
+    node <- node.for.k(k)
+
+    # --- CORRECTION ---
+    # Blocage direct si la taille du nœud courant est plus petite que min_pts
+    # Les sous-nœuds hériteront ensuite de ce blocage lors des itérations suivantes.
+    if (node_sizes[node] < min_pts) {
+      is_node_blocked[k_str] <- TRUE
+      pvals[k_str] <- NA_real_
+      if (verbose) {
+        cat(
+          "k =",
+          k,
+          "--- ignoré (noeud total < min_pts, taille =",
+          node_sizes[node],
+          ") -> bloqué\n"
+        )
+      }
+      next
+    }
+
+    # Vérification du blocage de l'ascendance
+    if (!is.na(parent_k)) {
+      parent_k_str <- as.character(parent_k)
+      parent_blocked <- is_node_blocked[parent_k_str]
+      parent_pval <- pvals[parent_k_str]
+
+      # Si un ancêtre est bloqué OU si sa p-value est >= alpha -> blocage immédiat
+      if (parent_blocked || (!is.na(parent_pval) && parent_pval >= alpha)) {
+        is_node_blocked[k_str] <- TRUE
+        if (verbose) {
+          cat(
+            "k =",
+            k,
+            "--- bloqué par l'ascendance (parent k =",
+            parent_k,
+            ")\n"
+          )
+        }
+        next
+      }
+    }
+
+    raw_pval <- run_one_k(k)
+
+    if (!is.na(raw_pval)) {
+      raw_history <- c(raw_history, raw_pval)
+      if (is.null(correction)) {
+        decision_pval <- raw_pval
+      } else {
+        corrected_history <- correction.multiplicity(
+          raw_history,
+          correction = correction,
+          alpha = alpha,
+          verbose = FALSE
+        )
+        decision_pval <- corrected_history[length(corrected_history)]
+      }
+      pvals[k_str] <- decision_pval
+    } else {
+      pvals[k_str] <- NA_real_
+      decision_pval <- NA_real_
+    }
+
+    # Mise à jour du nombre de branches actives
+    if (is.na(decision_pval)) {
+      # Split asymétrique : le sous-cluster bruit s'arrête, la branche principale continue seule
+    } else if (decision_pval < alpha) {
+      active_count <- active_count + 1
+    } else {
+      active_count <- active_count - 1
+    }
+
+    if (active_count <= 0) {
+      if (verbose) {
+        cat(
+          "Toutes les branches sont bloquées à k =",
+          k,
+          "--- early stopping avant kmax =",
+          kmax,
+          ".\n"
+        )
+      }
+      break
     }
   }
 
-  visit(n - 1)
-
-  sort(unique(k_list))
+  pvals
 }
+
+selective.cutree <- function(hcl, pvals, alpha = 0.05, min_pts = 1) {
+  n <- length(hcl$order)
+  labels <- integer(n) # Par défaut, tout est initialisé à 0 (Bruit)
+  node_sizes <- get.node.sizes(hcl)
+  cluster_id <- 1L
+
+  visit <- function(row) {
+    k <- n - row + 1
+    c1 <- hcl$merge[row, 1]
+    c2 <- hcl$merge[row, 2]
+
+    s1 <- if (c1 < 0) 1L else node_sizes[c1]
+    s2 <- if (c2 < 0) 1L else node_sizes[c2]
+
+    # Cas 1 : Les deux sous-clusters sont trop petits -> Bruit (reste 0)
+    if (s1 < min_pts && s2 < min_pts) {
+      return()
+    }
+
+    # Cas 2 : c1 est trop petit (bruit), c2 est valide -> continuer dans c2
+    if (s1 < min_pts && s2 >= min_pts) {
+      if (c2 > 0) {
+        visit(c2)
+      } else {
+        labels[-c2] <<- cluster_id
+        cluster_id <<- cluster_id + 1L
+      }
+      return()
+    }
+
+    # Cas 3 : c2 est trop petit (bruit), c1 est valide -> continuer dans c1
+    if (s2 < min_pts && s1 >= min_pts) {
+      if (c1 > 0) {
+        visit(c1)
+      } else {
+        labels[-c1] <<- cluster_id
+        cluster_id <<- cluster_id + 1L
+      }
+      return()
+    }
+
+    # Cas 4 : Les deux sont >= min_pts -> vérifier la p-value
+    pval <- pvals[as.character(k)]
+
+    # Si pval est NA ou non significative (>= alpha), on s'arrête et on crée un cluster
+    if (is.na(pval) || pval >= alpha) {
+      leafs <- get.node.leafs(hcl, row)
+      labels[leafs] <<- cluster_id
+      cluster_id <<- cluster_id + 1L
+      return()
+    }
+
+    # Si pval < alpha, on continue de descendre dans les deux branches
+    if (c1 > 0) {
+      visit(c1)
+    } else {
+      labels[-c1] <<- cluster_id
+      cluster_id <<- cluster_id + 1L
+    }
+    if (c2 > 0) {
+      visit(c2)
+    } else {
+      labels[-c2] <<- cluster_id
+      cluster_id <<- cluster_id + 1L
+    }
+  }
+  visit(n - 1)
+  labels
+}
+
 
 compute.pvals.split <- function(G, MAP, kmax, split_size) {
   k_seq <- 2:kmax
@@ -747,15 +1175,6 @@ add_cluster_strips <- function(p, leaves_long, strip_height) {
   p
 }
 
-get.mean_hat <- function(data, population) {
-  pop_means <- aggregate(data, by = list(population = population), FUN = mean)
-  pop_means_mat <- as.matrix(pop_means[, -1])
-  mean_hat <- pop_means_mat[match(population, pop_means$population), ]
-  mean_hat
-}
-
-
-# changer data structurepour inclure date (jsp si ça change quelque chose)
 correction.multiplicity <- function(
   pvals,
   correction = c(
@@ -797,4 +1216,27 @@ correction.multiplicity <- function(
   }
   pvals[non_na_idx] <- pvals_corrected
   pvals
+}
+
+
+build.heatmap.matrix <- function(
+  true_labels,
+  predicted_clusters,
+  prop = FALSE
+) {
+  M <- table(predicted_clusters, true_labels)
+  if (prop) {
+    M <- prop.table(M, margin = 2)
+  }
+  M <- as.matrix(M)
+  if (ncol(M) >= nrow(M)) {
+    perm <- as.integer(solve_LSAP(M, maximum = TRUE))
+    remaining <- setdiff(seq_len(ncol(M)), perm)
+    M <- M[, c(perm, remaining)]
+  } else {
+    perm <- as.integer(solve_LSAP(t(M), maximum = TRUE))
+    remaining <- setdiff(seq_len(nrow(M)), perm)
+    M <- M[c(perm, remaining), ]
+  }
+  M
 }
