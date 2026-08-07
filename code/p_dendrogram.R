@@ -1,4 +1,5 @@
 library(ggplot2)
+library(clue)
 library(progressr)
 library(scales)
 library(patchwork)
@@ -169,76 +170,81 @@ plotly.pdendrogram <- function(p, slider = FALSE) {
 }
 
 
-selective.cutree <- function(hcl, pvals, alpha = 0.05, min_pts = 1) {
-  n <- length(hcl$order)
-  labels <- integer(n) # Par défaut, tout est initialisé à 0 (Bruit)
+selective.cutree <- function(
+  hcl,
+  pvals,
+  min_pts = 10,
+  alpha = 0.05
+) {
   node_sizes <- get.node.sizes(hcl)
+  n_obs <- length(hcl$order)
+  labels <- rep(0L, n_obs)
   cluster_id <- 1L
 
-  visit <- function(row) {
-    k <- n - row + 1
+  # Fonction récursive de visite de l'arbre
+  # On garde 'peeling_root' en mémoire pour annuler le bruit si cul-de-sac
+  visit <- function(row, peeling_root) {
+    if (row < 0) {
+      return()
+    }
+
     c1 <- hcl$merge[row, 1]
     c2 <- hcl$merge[row, 2]
 
-    s1 <- if (c1 < 0) 1L else node_sizes[c1]
-    s2 <- if (c2 < 0) 1L else node_sizes[c2]
+    s1 <- if (c1 < 0) 1 else node_sizes[c1]
+    s2 <- if (c2 < 0) 1 else node_sizes[c2]
 
-    # Cas 1 : Les deux sous-clusters sont trop petits -> Bruit (reste 0)
+    # Cas 1 : Cul-de-sac (les deux enfants sont trop petits)
     if (s1 < min_pts && s2 < min_pts) {
-      return()
-    }
-
-    # Cas 2 : c1 est trop petit (bruit), c2 est valide -> continuer dans c2
-    if (s1 < min_pts && s2 >= min_pts) {
-      if (c2 > 0) {
-        visit(c2)
-      } else {
-        labels[-c2] <<- cluster_id
-        cluster_id <<- cluster_id + 1L
-      }
-      return()
-    }
-
-    # Cas 3 : c2 est trop petit (bruit), c1 est valide -> continuer dans c1
-    if (s2 < min_pts && s1 >= min_pts) {
-      if (c1 > 0) {
-        visit(c1)
-      } else {
-        labels[-c1] <<- cluster_id
-        cluster_id <<- cluster_id + 1L
-      }
-      return()
-    }
-
-    # Cas 4 : Les deux sont >= min_pts -> vérifier la p-value
-    pval <- pvals[as.character(k)]
-
-    # Si pval est NA ou non significative (>= alpha), on s'arrête et on crée un cluster
-    if (is.na(pval) || pval >= alpha) {
-      leafs <- get.node.leafs(hcl, row)
+      leafs <- get.node.leafs(hcl, peeling_root, node_sizes)
       labels[leafs] <<- cluster_id
       cluster_id <<- cluster_id + 1L
       return()
     }
 
-    # Si pval < alpha, on continue de descendre dans les deux branches
-    if (c1 > 0) {
-      visit(c1)
-    } else {
-      labels[-c1] <<- cluster_id
-      cluster_id <<- cluster_id + 1L
+    # Cas 2 : Grignotage asymétrique (gauche trop petit, on continue à droite)
+    if (s1 < min_pts && s2 >= min_pts) {
+      if (c2 > 0) {
+        visit(c2, peeling_root)
+      }
+      return()
     }
-    if (c2 > 0) {
-      visit(c2)
-    } else {
-      labels[-c2] <<- cluster_id
-      cluster_id <<- cluster_id + 1L
+
+    # Cas 3 : Grignotage asymétrique (droite trop petit, on continue à gauche)
+    if (s1 >= min_pts && s2 < min_pts) {
+      if (c1 > 0) {
+        visit(c1, peeling_root)
+      }
+      return()
+    }
+
+    # Cas 4 : Les deux enfants sont assez grands (test de validité)
+    if (s1 >= min_pts && s2 >= min_pts) {
+      # FIX 2 : Traduction de l'indice de ligne (row) vers le nombre de clusters (k)
+      k <- n_obs - row + 1
+      p_val <- pvals[as.character(k)]
+
+      if (!is.na(p_val) && p_val < alpha) {
+        # Split significatif : les enfants deviennent de nouvelles racines de pelage
+        if (c1 > 0) {
+          visit(c1, peeling_root = c1)
+        }
+        if (c2 > 0) visit(c2, peeling_root = c2)
+      } else {
+        # Noyau dur trouvé : on valide le noyau courant
+        leafs <- get.node.leafs(hcl, row, node_sizes)
+        labels[leafs] <<- cluster_id
+        cluster_id <<- cluster_id + 1L
+      }
+      return()
     }
   }
-  visit(n - 1)
-  labels
-}
 
+  root_node <- nrow(hcl$merge)
+  visit(root_node, peeling_root = root_node)
+
+  return(labels)
+}
 
 plot.heatmap <- function(
   true_labels,
